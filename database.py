@@ -134,6 +134,31 @@ def create_tables():
         """)
         print("  [~] Migrare: coloana 'snapshot' (T24h/T12h/T0h) a fost adaugata la cotele manuale existente.")
 
+    # Migrare: coloanele "pick" (alegerea ta: '1'/'X'/'2') si "actual_result"
+    # (rezultatul real al meciului, completat manual dupa disputarea lui),
+    # necesare pentru a determina daca pariul a fost castigat sau pierdut.
+    if "pick" not in existing_cols:
+        cur.execute("ALTER TABLE manual_odds ADD COLUMN pick TEXT;")
+        print("  [~] Migrare: coloana 'pick' (alegerea ta) a fost adaugata la cotele manuale existente.")
+    if "actual_result" not in existing_cols:
+        cur.execute("ALTER TABLE manual_odds ADD COLUMN actual_result TEXT;")
+        print("  [~] Migrare: coloana 'actual_result' a fost adaugata la cotele manuale existente.")
+
+    # Migrare: coloana "archived" — marcheaza ziua de pariuri ca mutata in
+    # Istoric (butonul "Salveaza istoric" din Predictie). 0 = activa in
+    # Predictie, 1 = arhivata, vizibila doar in Istoric.
+    if "archived" not in existing_cols:
+        cur.execute("ALTER TABLE manual_odds ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;")
+        print("  [~] Migrare: coloana 'archived' a fost adaugata la cotele manuale existente.")
+
+    # Migrare: "archived_at" — momentul cand a fost apasat "Salveaza istoric",
+    # folosit pentru a grupa in Istoric pariurile arhivate impreuna, indiferent
+    # de competitie sau data meciului (grupare pe sesiunea de lucru, nu pe
+    # data meciului).
+    if "archived_at" not in existing_cols:
+        cur.execute("ALTER TABLE manual_odds ADD COLUMN archived_at TEXT;")
+        print("  [~] Migrare: coloana 'archived_at' a fost adaugata la cotele manuale existente.")
+
     # Un singur set de cote per meci + moment (T24h/T12h/T0h). Daca introduci
     # din nou cote pentru acelasi meci si acelasi moment, valoarea veche este
     # inlocuita (INSERT OR REPLACE), nu duplicata.
@@ -302,10 +327,14 @@ def fetch_teams_for_competition(competition_id: int):
 
 def insert_manual_odds(competition_id: int, home_team: str, away_team: str,
                         match_date: str, snapshot: str, odds_home: float,
-                        odds_draw: float, odds_away: float, source: str = "manual"):
+                        odds_draw: float, odds_away: float, source: str = "manual",
+                        pick: str = None):
     """
     Insereaza (sau suprascrie, daca exista deja) cotele pentru un meci la un
     anumit moment fata de start: 'T24h', 'T12h' sau 'T0h'.
+
+    pick: alegerea ta pentru acest pariu ('1' / 'X' / '2'), aceeasi pentru
+    toate momentele (T24h si T0h) ale aceluiasi meci.
     """
     from datetime import datetime
 
@@ -314,11 +343,54 @@ def insert_manual_odds(competition_id: int, home_team: str, away_team: str,
     cur.execute("""
         INSERT OR REPLACE INTO manual_odds
             (competition_id, home_team, away_team, match_date, snapshot,
-             odds_home, odds_draw, odds_away, source, entered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             odds_home, odds_draw, odds_away, source, entered_at, pick)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (competition_id, home_team, away_team, match_date, snapshot,
           odds_home, odds_draw, odds_away, source,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pick))
+    conn.commit()
+    conn.close()
+
+
+def set_bet_result(entry_id: int, actual_result: str):
+    """
+    Salveaza rezultatul real al meciului ('1' / 'X' / '2') pentru un pariu
+    salvat, ca sa se poata determina daca a fost castigat sau pierdut.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE manual_odds SET actual_result = ? WHERE id = ?", (actual_result, entry_id))
+    conn.commit()
+    conn.close()
+
+
+def archive_all_active_bets():
+    """
+    Muta TOATE pariurile active (nearhivate inca) din Predictie in Istoric,
+    indiferent de competitie sau data meciului — corespunde apasarii
+    butonului "Salveaza istoric" la finalul unei sesiuni de lucru (zi).
+    """
+    from datetime import datetime
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE manual_odds SET archived = 1, archived_at = ? WHERE archived = 0",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def reset_all_bets():
+    """
+    Sterge definitiv TOATE pariurile (active din Predictie + arhivate din
+    Istoric), din toate competitiile — butonul "Default Reset". Nu afecteaza
+    cotele urmarite fara o alegere (pick) asociata, daca exista.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM manual_odds WHERE pick IS NOT NULL")
     conn.commit()
     conn.close()
 
@@ -331,7 +403,7 @@ def fetch_manual_odds(competition_id: int = None):
     query = """
         SELECT mo.id, c.name AS competition, mo.home_team, mo.away_team,
                mo.match_date, mo.snapshot, mo.odds_home, mo.odds_draw, mo.odds_away,
-               mo.source, mo.entered_at
+               mo.source, mo.entered_at, mo.pick, mo.actual_result, mo.archived, mo.archived_at
         FROM manual_odds mo
         JOIN competitions c ON mo.competition_id = c.id
     """
